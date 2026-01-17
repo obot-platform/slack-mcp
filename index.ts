@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { WebClient, ErrorCode } from "@slack/web-api";
+import { WebClient } from "@slack/web-api";
 import Fuse from "fuse.js";
 import slackifyMarkdown from "slackify-markdown";
 
@@ -156,6 +156,57 @@ const SendTypingEventSchema = z.object({
     ),
 });
 
+// Pass Zod schemas through without triggering deep type inference.
+const toolSchema = (schema: z.ZodTypeAny): z.ZodTypeAny => schema;
+
+
+// Helpful inferred types to reduce inference pressure at call sites
+type ListChannelsArgs = Record<string, never>;
+type SearchChannelsArgs = { query: string };
+type AddUserToChannelArgs = { channelId: string; userId: string };
+type GetChannelHistoryArgs = { channelId: string; limit: number };
+type GetChannelHistoryByTimeArgs = {
+  channelId: string;
+  limit: number;
+  start: string;
+  end: string;
+};
+type GetThreadHistoryArgs = {
+  channelId: string;
+  threadId: string;
+  limit: number;
+};
+type GetThreadHistoryFromLinkArgs = { messageLink: string; limit: number };
+type SearchMessagesArgs = { query: string; sortByTime: boolean };
+type SendMessageArgs = { channelId: string; text: string };
+type SendMessageInThreadArgs = {
+  channelId: string;
+  threadId: string;
+  text: string;
+};
+type ListUsersArgs = Record<string, never>;
+type SearchUsersArgs = { query: string };
+type SendDMArgs = { userIds: string; text: string };
+type SendDMInThreadArgs = {
+  userIds: string;
+  threadId: string;
+  text: string;
+};
+type GetMessageLinkArgs = { channelId: string; messageId: string };
+type GetDMHistoryArgs = { userIds: string; limit: number };
+type GetDMThreadHistoryArgs = {
+  userIds: string;
+  threadId: string;
+  limit: number;
+};
+type UserContextArgs = Record<string, never>;
+type SendTypingEventArgs = {
+  channelId: string;
+  threadId?: string;
+  status: string;
+};
+
+
 class SlackClient {
   private webClient: WebClient;
 
@@ -204,10 +255,6 @@ class SlackClient {
   }
 
   async addUserToChannel(channelId: string, userId: string) {
-    // The Slack SDK will always throw an error instead of a partial response for failed requests
-    // since we're adding a single user at a time.
-    // We don't bother returning the response object here, since if the call doesn't return
-    // an error, we know the user was added successfully.
     await this.webClient.conversations.invite({
       channel: channelId,
       users: userId,
@@ -272,15 +319,12 @@ class SlackClient {
   }
 
   removeBoldInHeadings(markdownText: string) {
-    // Both headings and bold text will get converted to bold in slack.
-    // This function removes the bold markers from headings to help the parser to return the correct text
-    // without this , # Welcome to *Markdown* → Slack **Test** --> *Welcome to ​_Markdown_​ → Slack *Test** , which is incorrect.
     return markdownText
       .split("\n")
       .map((line) => {
         const headingMatch = line.match(/^(\s{0,3}#+\s)(.*)$/);
         if (headingMatch) {
-          const prefix = headingMatch[1]; // "# ", "## ", etc.
+          const prefix = headingMatch[1];
           let content = headingMatch[2];
           content = content.replace(/\*\*(.+?)\*\*/g, "$1");
           content = content.replace(/__(.+?)__/g, "$1");
@@ -292,7 +336,6 @@ class SlackClient {
   }
 
   markdownToSlack(text: string) {
-    // Convert markdown format text to slack format text.
     text = this.removeBoldInHeadings(text);
     return slackifyMarkdown(text);
   }
@@ -445,308 +488,358 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
     },
   );
 
+  // Register tools without forcing TypeScript to deeply infer Zod schema types.
+  const registerTool = (
+    name: string,
+    definition: Record<string, unknown>,
+    handler: (args: any) => Promise<CallToolResult>,
+  ) => {
+    return (server as any).registerTool(name, definition, handler);
+  };
+
   const isBotToken = token.startsWith("xoxb-");
 
-  server.tool(
+  registerTool(
     "list_channels",
-    "List all channels in the Slack workspace. Returns the name and ID for each channel",
-    ListChannelsSchema.shape,
-    async (args, { sendNotification }): Promise<CallToolResult> => {
+    {
+      description:
+        "List all channels in the Slack workspace. Returns the name and ID for each channel",
+      inputSchema: toolSchema(ListChannelsSchema),
+    },
+    async (_args: ListChannelsArgs): Promise<CallToolResult> => {
       const channels = await slackClient.listChannels();
       return {
+        structuredContent: { channels },
         content: [{ type: "text", text: JSON.stringify(channels, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "search_channels",
-    "Search for channels in the Slack workspace",
-    SearchChannelsSchema.shape,
-    async ({ query }, { sendNotification }): Promise<CallToolResult> => {
-      const channels = await slackClient.searchChannels(query);
+    {
+      description: "Search for channels in the Slack workspace",
+      inputSchema: toolSchema(SearchChannelsSchema),
+    },
+    async (args: SearchChannelsArgs): Promise<CallToolResult> => {
+      const channels = await slackClient.searchChannels(args.query);
       return {
+        structuredContent: { channels },
         content: [{ type: "text", text: JSON.stringify(channels, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "add_user_to_channel",
-    "Add a user to a channel in the Slack workspace",
-    AddUserToChannelSchema.shape,
-    async (
-      { channelId, userId },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
+    {
+      description: "Add a user to a channel in the Slack workspace",
+      inputSchema: toolSchema(AddUserToChannelSchema),
+    },
+    async (args: AddUserToChannelArgs): Promise<CallToolResult> => {
       try {
-        await slackClient.addUserToChannel(channelId, userId);
+        await slackClient.addUserToChannel(args.channelId, args.userId);
       } catch (error) {
-        // Rethrow errors, ignoring already_in_channel to make this tool idempotent.
         if ((error as any)?.data?.error !== "already_in_channel") {
           throw error;
         }
       }
 
-      // Invite was successful or the user was already invited to the channel
       return {
+        structuredContent: {
+          channelId: args.channelId,
+          userId: args.userId,
+          status: "added_or_already_in_channel",
+        },
         content: [
           {
             type: "text",
-            text: `User ${userId} added to channel ${channelId}`,
+            text: `User ${args.userId} added to channel ${args.channelId}`,
           },
         ],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "get_channel_history",
-    "Get the chat history for a channel in the Slack workspace",
-    GetChannelHistorySchema.shape,
-    async (
-      { channelId, limit },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      const messages = await slackClient.getChannelHistory(channelId, limit);
+    {
+      description: "Get the chat history for a channel in the Slack workspace",
+      inputSchema: toolSchema(GetChannelHistorySchema),
+    },
+    async (args: GetChannelHistoryArgs): Promise<CallToolResult> => {
+      const messages = await slackClient.getChannelHistory(
+        args.channelId,
+        args.limit,
+      );
       return {
+        structuredContent: { messages },
         content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "get_channel_history_by_time",
-    "Get the chat history for a channel in the Slack workspace within a specific time range",
-    GetChannelHistoryByTimeSchema.shape,
-    async (
-      { channelId, limit, start, end },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
+    {
+      description:
+        "Get the chat history for a channel in the Slack workspace within a specific time range",
+      inputSchema: toolSchema(GetChannelHistoryByTimeSchema),
+    },
+    async (args: GetChannelHistoryByTimeArgs): Promise<CallToolResult> => {
       const messages = await slackClient.getChannelHistoryByTime(
-        channelId,
-        limit,
-        start,
-        end,
+        args.channelId,
+        args.limit,
+        args.start,
+        args.end,
       );
       return {
+        structuredContent: { messages },
         content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "get_thread_history",
-    "Get the chat history for a particular thread",
-    GetThreadHistorySchema.shape,
-    async (
-      { channelId, threadId, limit },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
+    {
+      description: "Get the chat history for a particular thread",
+      inputSchema: toolSchema(GetThreadHistorySchema),
+    },
+    async (args: GetThreadHistoryArgs): Promise<CallToolResult> => {
       const messages = await slackClient.getThreadHistory(
-        channelId,
-        threadId,
-        limit,
+        args.channelId,
+        args.threadId,
+        args.limit,
       );
       return {
+        structuredContent: { messages },
         content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "get_thread_history_from_link",
-    "Get the chat history for a particular thread from a Slack message link",
-    GetThreadHistoryFromLinkSchema.shape,
-    async (
-      { messageLink, limit },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
+    {
+      description:
+        "Get the chat history for a particular thread from a Slack message link",
+      inputSchema: toolSchema(GetThreadHistoryFromLinkSchema),
+    },
+    async (args: GetThreadHistoryFromLinkArgs): Promise<CallToolResult> => {
       const messages = await slackClient.getThreadHistoryFromLink(
-        messageLink,
-        limit,
+        args.messageLink,
+        args.limit,
       );
       return {
+        structuredContent: { messages },
         content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
       };
     },
   );
 
   if (!isBotToken) {
-    server.tool(
+    registerTool(
       "search_messages",
-      "Search for messages in the Slack workspace",
-      SearchMessagesSchema.shape,
-      async (
-        { query, sortByTime },
-        { sendNotification },
-      ): Promise<CallToolResult> => {
-        const messages = await slackClient.searchMessages(query, sortByTime);
-        return {
-          content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
-        };
+      {
+        description: "Search for messages in the Slack workspace",
+        inputSchema: toolSchema(SearchMessagesSchema),
       },
-    );
-    server.tool(
-      "get_dm_history",
-      "Get the chat history for a direct message conversation",
-      GetDMHistorySchema.shape,
-      async (
-        { userIds, limit },
-        { sendNotification },
-      ): Promise<CallToolResult> => {
-        const messages = await slackClient.getDMHistory(userIds, limit);
+      async (args: SearchMessagesArgs): Promise<CallToolResult> => {
+        const messages = await slackClient.searchMessages(
+          args.query,
+          args.sortByTime,
+        );
         return {
+          structuredContent: { messages },
           content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
         };
       },
     );
 
-    server.tool(
+    registerTool(
+      "get_dm_history",
+      {
+        description: "Get the chat history for a direct message conversation",
+        inputSchema: toolSchema(GetDMHistorySchema),
+      },
+      async (args: GetDMHistoryArgs): Promise<CallToolResult> => {
+        const messages = await slackClient.getDMHistory(args.userIds, args.limit);
+        return {
+          structuredContent: { messages },
+          content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
+        };
+      },
+    );
+
+    registerTool(
       "get_dm_thread_history",
-      "Get the chat history for a thread in a direct message conversation",
-      GetDMThreadHistorySchema.shape,
-      async (
-        { userIds, threadId, limit },
-        { sendNotification },
-      ): Promise<CallToolResult> => {
+      {
+        description:
+          "Get the chat history for a thread in a direct message conversation",
+        inputSchema: toolSchema(GetDMThreadHistorySchema),
+      },
+      async (args: GetDMThreadHistoryArgs): Promise<CallToolResult> => {
         const messages = await slackClient.getDMThreadHistory(
-          userIds,
-          threadId,
-          limit,
+          args.userIds,
+          args.threadId,
+          args.limit,
         );
         return {
+          structuredContent: { messages },
           content: [{ type: "text", text: JSON.stringify(messages, null, 2) }],
         };
       },
     );
   }
 
-  server.tool(
+  registerTool(
     "send_message",
-    "Send a message to a channel in the Slack workspace",
-    SendMessageSchema.shape,
-    async (
-      { channelId, text },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      const result = await slackClient.sendMessage(channelId, text);
+    {
+      description: "Send a message to a channel in the Slack workspace",
+      inputSchema: toolSchema(SendMessageSchema),
+    },
+    async (args: SendMessageArgs): Promise<CallToolResult> => {
+      const result = await slackClient.sendMessage(args.channelId, args.text);
       return {
+        structuredContent: { result },
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "send_message_in_thread",
-    "Send a message in a thread in the Slack workspace",
-    SendMessageInThreadSchema.shape,
-    async (
-      { channelId, threadId, text },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
+    {
+      description: "Send a message in a thread in the Slack workspace",
+      inputSchema: toolSchema(SendMessageInThreadSchema),
+    },
+    async (args: SendMessageInThreadArgs): Promise<CallToolResult> => {
       const result = await slackClient.sendMessageInThread(
-        channelId,
-        threadId,
-        text,
+        args.channelId,
+        args.threadId,
+        args.text,
       );
       return {
+        structuredContent: { result },
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "list_users",
-    "List all users in the Slack workspace",
-    ListUsersSchema.shape,
-    async (args, { sendNotification }): Promise<CallToolResult> => {
+    {
+      description: "List all users in the Slack workspace",
+      inputSchema: toolSchema(ListUsersSchema),
+    },
+    async (_args: ListUsersArgs): Promise<CallToolResult> => {
       const users = await slackClient.listUsers();
       return {
+        structuredContent: { users },
         content: [{ type: "text", text: JSON.stringify(users, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "search_users",
-    "Search for users in the Slack workspace",
-    SearchUsersSchema.shape,
-    async ({ query }, { sendNotification }): Promise<CallToolResult> => {
-      const users = await slackClient.searchUsers(query);
+    {
+      description: "Search for users in the Slack workspace",
+      inputSchema: toolSchema(SearchUsersSchema),
+    },
+    async (args: SearchUsersArgs): Promise<CallToolResult> => {
+      const users = await slackClient.searchUsers(args.query);
       return {
+        structuredContent: { users },
         content: [{ type: "text", text: JSON.stringify(users, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "send_dm",
-    "Send a direct message to a user",
-    SendDMSchema.shape,
-    async (
-      { userIds, text },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      const result = await slackClient.sendDM(userIds, text);
+    {
+      description: "Send a direct message to a user",
+      inputSchema: toolSchema(SendDMSchema),
+    },
+    async (args: SendDMArgs): Promise<CallToolResult> => {
+      const result = await slackClient.sendDM(args.userIds, args.text);
       return {
+        structuredContent: { result },
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "send_dm_in_thread",
-    "Send a message in a thread in a direct message conversation",
-    SendDMInThreadSchema.shape,
-    async (
-      { userIds, threadId, text },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      const result = await slackClient.sendDMInThread(userIds, threadId, text);
+    {
+      description:
+        "Send a message in a thread in a direct message conversation",
+      inputSchema: toolSchema(SendDMInThreadSchema),
+    },
+    async (args: SendDMInThreadArgs): Promise<CallToolResult> => {
+      const result = await slackClient.sendDMInThread(
+        args.userIds,
+        args.threadId,
+        args.text,
+      );
       return {
+        structuredContent: { result },
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "get_message_link",
-    "Get the permalink for a message",
-    GetMessageLinkSchema.shape,
-    async (
-      { channelId, messageId },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      const link = await slackClient.getMessageLink(channelId, messageId);
+    {
+      description: "Get the permalink for a message",
+      inputSchema: toolSchema(GetMessageLinkSchema),
+    },
+    async (args: GetMessageLinkArgs): Promise<CallToolResult> => {
+      const link = await slackClient.getMessageLink(
+        args.channelId,
+        args.messageId,
+      );
       return {
+        structuredContent: { link },
         content: [{ type: "text", text: JSON.stringify({ link }, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "user_context",
-    "Get information about the logged in user",
-    UserContextSchema.shape,
-    async (args, { sendNotification }): Promise<CallToolResult> => {
+    {
+      description: "Get information about the logged in user",
+      inputSchema: toolSchema(UserContextSchema),
+    },
+    async (_args: UserContextArgs): Promise<CallToolResult> => {
       const userInfo = await slackClient.userContext();
       return {
+        structuredContent: { userInfo },
         content: [{ type: "text", text: JSON.stringify(userInfo, null, 2) }],
       };
     },
   );
 
-  server.tool(
+  registerTool(
     "send_typing_event",
-    "Send a typing event to a channel in the Slack workspace",
-    SendTypingEventSchema.shape,
-    async (
-      { channelId, threadId, status },
-      { sendNotification },
-    ): Promise<CallToolResult> => {
-      await slackClient.sendTypingEvent(channelId, threadId, status);
+    {
+      description: "Send a typing event to a channel in the Slack workspace",
+      inputSchema: toolSchema(SendTypingEventSchema),
+    },
+    async (args: SendTypingEventArgs): Promise<CallToolResult> => {
+      await slackClient.sendTypingEvent(args.channelId, args.threadId, args.status);
       return {
+        structuredContent: {
+          channelId: args.channelId,
+          threadId: args.threadId ?? null,
+          status: args.status,
+          ok: true,
+        },
         content: [{ type: "text", text: "Typing event sent" }],
       };
     },
@@ -804,7 +897,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get("/mcp", async (_req: Request, res: Response) => {
   console.log("Received GET MCP request");
   res.writeHead(405).end(
     JSON.stringify({
@@ -818,7 +911,7 @@ app.get("/mcp", async (req: Request, res: Response) => {
   );
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete("/mcp", async (_req: Request, res: Response) => {
   console.log("Received DELETE MCP request");
   res.writeHead(405).end(
     JSON.stringify({
@@ -845,3 +938,4 @@ process.on("SIGINT", async () => {
   console.log("Shutting down server...");
   process.exit(0);
 });
+
