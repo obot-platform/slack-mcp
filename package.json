@@ -16,7 +16,6 @@
     "@types/express": "^5.0.3",
     "cors": "^2.8.5",
     "express": "5.1.0",
-    "fuse.js": "^7.1.0",
     "slackify-markdown": "^4.4.0",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.23.8"
