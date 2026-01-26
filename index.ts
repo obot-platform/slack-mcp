@@ -3,17 +3,27 @@
 import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { WebClient } from "@slack/web-api";
-import Fuse from "fuse.js";
 import slackifyMarkdown from "slackify-markdown";
 
 // Schema definitions for all tools
-const ListChannelsSchema = z.object({});
+const ListChannelsSchema = z.object({
+  limit: z.number().optional().default(100)
+    .describe("Number of channels per page (default 100, max 200)"),
+  cursor: z.string().optional()
+    .describe("Pagination cursor from previous response"),
+});
+
+const GetChannelByNameSchema = z.object({
+  name: z.string().describe("Exact channel name to find (without #)"),
+});
 
 const SearchChannelsSchema = z.object({
-  query: z.string().describe("The search query for channels"),
+  query: z.string().describe("Search term to find in channel names"),
+  limit: z.number().optional().default(20)
+    .describe("Maximum results to return (default 20)"),
 });
 
 const AddUserToChannelSchema = z.object({
@@ -88,10 +98,21 @@ const SendMessageInThreadSchema = z.object({
   text: z.string().describe("The text to send"),
 });
 
-const ListUsersSchema = z.object({});
+const ListUsersSchema = z.object({
+  limit: z.number().optional().default(100)
+    .describe("Number of users per page (default 100, max 200)"),
+  cursor: z.string().optional()
+    .describe("Pagination cursor from previous response"),
+});
+
+const GetUserByNameSchema = z.object({
+  name: z.string().describe("Username, display name, or real name to find"),
+});
 
 const SearchUsersSchema = z.object({
-  query: z.string().describe("The search query for users"),
+  query: z.string().describe("Search term to find in user names"),
+  limit: z.number().optional().default(20)
+    .describe("Maximum results to return (default 20)"),
 });
 
 const SendDMSchema = z.object({
@@ -161,8 +182,9 @@ const toolSchema = (schema: z.ZodTypeAny): z.ZodTypeAny => schema;
 
 
 // Helpful inferred types to reduce inference pressure at call sites
-type ListChannelsArgs = Record<string, never>;
-type SearchChannelsArgs = { query: string };
+type ListChannelsArgs = { limit: number; cursor?: string };
+type GetChannelByNameArgs = { name: string };
+type SearchChannelsArgs = { query: string; limit: number };
 type AddUserToChannelArgs = { channelId: string; userId: string };
 type GetChannelHistoryArgs = { channelId: string; limit: number };
 type GetChannelHistoryByTimeArgs = {
@@ -184,8 +206,9 @@ type SendMessageInThreadArgs = {
   threadId: string;
   text: string;
 };
-type ListUsersArgs = Record<string, never>;
-type SearchUsersArgs = { query: string };
+type ListUsersArgs = { limit: number; cursor?: string };
+type GetUserByNameArgs = { name: string };
+type SearchUsersArgs = { query: string; limit: number };
 type SendDMArgs = { userIds: string; text: string };
 type SendDMInThreadArgs = {
   userIds: string;
@@ -227,31 +250,55 @@ class SlackClient {
     };
   }
 
-  async listChannels() {
-    let allChannels: any[] = [];
-    let cursor;
+  async listChannels(limit: number = 100, cursor?: string) {
+    const result = await this.webClient.conversations.list({
+      limit: Math.min(limit, 200),
+      types: "public_channel,private_channel",
+      cursor: cursor,
+    });
+    return {
+      channels: result.channels ?? [],
+      next_cursor: result.response_metadata?.next_cursor ?? "",
+    };
+  }
+
+  async getChannelByName(name: string) {
+    const normalizedName = name.toLowerCase().replace(/^#/, "");
+    let cursor: string | undefined;
     do {
       const result = await this.webClient.conversations.list({
-        limit: 100,
+        limit: 200,
         types: "public_channel,private_channel",
-        cursor: cursor,
+        cursor,
       });
-      if (result.channels) {
-        allChannels = allChannels.concat(result.channels);
+      const found = result.channels?.find(
+        (ch) => ch.name?.toLowerCase() === normalizedName
+      );
+      if (found) return found;
+      cursor = result.response_metadata?.next_cursor;
+    } while (cursor);
+    return null;
+  }
+
+  async searchChannels(query: string, limit: number = 20) {
+    const normalizedQuery = query.toLowerCase();
+    const matches: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await this.webClient.conversations.list({
+        limit: 200,
+        types: "public_channel,private_channel",
+        cursor,
+      });
+      for (const channel of result.channels ?? []) {
+        if (channel.name?.toLowerCase().includes(normalizedQuery)) {
+          matches.push(channel);
+          if (matches.length >= limit) return matches;
+        }
       }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
-    return allChannels;
-  }
-
-  async searchChannels(query: string) {
-    const allChannels = await this.listChannels();
-    const fuse = new Fuse(allChannels, {
-      keys: ["name"],
-      threshold: 0.4,
-      findAllMatches: true,
-    });
-    return fuse.search(query).map((result) => result.item);
+    return matches;
   }
 
   async addUserToChannel(channelId: string, userId: string) {
@@ -357,30 +404,62 @@ class SlackClient {
     return result;
   }
 
-  async listUsers() {
-    let allUsers: any[] = [];
-    let cursor;
+  async listUsers(limit: number = 100, cursor?: string) {
+    const result = await this.webClient.users.list({
+      limit: Math.min(limit, 200),
+      cursor: cursor,
+    });
+    return {
+      users: result.members ?? [],
+      next_cursor: result.response_metadata?.next_cursor ?? "",
+    };
+  }
+
+  async getUserByName(name: string) {
+    const normalizedName = name.toLowerCase().replace(/^@/, "");
+    let cursor: string | undefined;
     do {
       const result = await this.webClient.users.list({
-        limit: 100,
-        cursor: cursor,
+        limit: 200,
+        cursor,
       });
-      if (result.members) {
-        allUsers = allUsers.concat(result.members);
+      const found = result.members?.find((u) => {
+        const username = u.name?.toLowerCase();
+        const displayName = u.profile?.display_name?.toLowerCase();
+        const realName = u.real_name?.toLowerCase();
+        return username === normalizedName ||
+               displayName === normalizedName ||
+               realName === normalizedName;
+      });
+      if (found) return found;
+      cursor = result.response_metadata?.next_cursor;
+    } while (cursor);
+    return null;
+  }
+
+  async searchUsers(query: string, limit: number = 20) {
+    const normalizedQuery = query.toLowerCase();
+    const matches: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await this.webClient.users.list({
+        limit: 200,
+        cursor,
+      });
+      for (const user of result.members ?? []) {
+        const username = user.name?.toLowerCase() ?? "";
+        const displayName = user.profile?.display_name?.toLowerCase() ?? "";
+        const realName = user.real_name?.toLowerCase() ?? "";
+        if (username.includes(normalizedQuery) ||
+            displayName.includes(normalizedQuery) ||
+            realName.includes(normalizedQuery)) {
+          matches.push(user);
+          if (matches.length >= limit) return matches;
+        }
       }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
-    return allUsers;
-  }
-
-  async searchUsers(query: string) {
-    const allUsers = await this.listUsers();
-    const fuse = new Fuse(allUsers, {
-      keys: ["name", "real_name", "profile.display_name"],
-      threshold: 0.4,
-      findAllMatches: true,
-    });
-    return fuse.search(query).map((result) => result.item);
+    return matches;
   }
 
   async sendDM(userIds: string, text: string) {
@@ -503,14 +582,36 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
     "list_channels",
     {
       description:
-        "List all channels in the Slack workspace. Returns the name and ID for each channel",
+        "List channels in the Slack workspace with pagination. Returns channels and a next_cursor. If next_cursor is non-empty, call again with cursor parameter to get more results.",
       inputSchema: toolSchema(ListChannelsSchema),
     },
-    async (_args: ListChannelsArgs): Promise<CallToolResult> => {
-      const channels = await slackClient.listChannels();
+    async (args: ListChannelsArgs): Promise<CallToolResult> => {
+      const result = await slackClient.listChannels(args.limit, args.cursor);
       return {
-        structuredContent: { channels },
-        content: [{ type: "text", text: JSON.stringify(channels, null, 2) }],
+        structuredContent: result,
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  registerTool(
+    "get_channel_by_name",
+    {
+      description:
+        "Get a channel by its exact name. Use this when you know the exact channel name. Returns the channel or null if not found.",
+      inputSchema: toolSchema(GetChannelByNameSchema),
+    },
+    async (args: GetChannelByNameArgs): Promise<CallToolResult> => {
+      const channel = await slackClient.getChannelByName(args.name);
+      if (!channel) {
+        return {
+          structuredContent: { channel: null },
+          content: [{ type: "text", text: `Channel "${args.name}" not found` }],
+        };
+      }
+      return {
+        structuredContent: { channel },
+        content: [{ type: "text", text: JSON.stringify(channel, null, 2) }],
       };
     },
   );
@@ -518,11 +619,12 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
   registerTool(
     "search_channels",
     {
-      description: "Search for channels in the Slack workspace",
+      description:
+        "Search for channels by name substring. Use this for discovery when you don't know the exact channel name.",
       inputSchema: toolSchema(SearchChannelsSchema),
     },
     async (args: SearchChannelsArgs): Promise<CallToolResult> => {
-      const channels = await slackClient.searchChannels(args.query);
+      const channels = await slackClient.searchChannels(args.query, args.limit);
       return {
         structuredContent: { channels },
         content: [{ type: "text", text: JSON.stringify(channels, null, 2) }],
@@ -730,14 +832,37 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
   registerTool(
     "list_users",
     {
-      description: "List all users in the Slack workspace",
+      description:
+        "List users in the Slack workspace with pagination. Returns users and a next_cursor. If next_cursor is non-empty, call again with cursor parameter to get more results.",
       inputSchema: toolSchema(ListUsersSchema),
     },
-    async (_args: ListUsersArgs): Promise<CallToolResult> => {
-      const users = await slackClient.listUsers();
+    async (args: ListUsersArgs): Promise<CallToolResult> => {
+      const result = await slackClient.listUsers(args.limit, args.cursor);
       return {
-        structuredContent: { users },
-        content: [{ type: "text", text: JSON.stringify(users, null, 2) }],
+        structuredContent: result,
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  registerTool(
+    "get_user_by_name",
+    {
+      description:
+        "Get a user by their exact username, display name, or real name. Use this when you know the exact name. Returns the user or null if not found.",
+      inputSchema: toolSchema(GetUserByNameSchema),
+    },
+    async (args: GetUserByNameArgs): Promise<CallToolResult> => {
+      const user = await slackClient.getUserByName(args.name);
+      if (!user) {
+        return {
+          structuredContent: { user: null },
+          content: [{ type: "text", text: `User "${args.name}" not found` }],
+        };
+      }
+      return {
+        structuredContent: { user },
+        content: [{ type: "text", text: JSON.stringify(user, null, 2) }],
       };
     },
   );
@@ -745,11 +870,12 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
   registerTool(
     "search_users",
     {
-      description: "Search for users in the Slack workspace",
+      description:
+        "Search for users by name substring. Use this for discovery when you don't know the exact username.",
       inputSchema: toolSchema(SearchUsersSchema),
     },
     async (args: SearchUsersArgs): Promise<CallToolResult> => {
-      const users = await slackClient.searchUsers(args.query);
+      const users = await slackClient.searchUsers(args.query, args.limit);
       return {
         structuredContent: { users },
         content: [{ type: "text", text: JSON.stringify(users, null, 2) }],
