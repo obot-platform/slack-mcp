@@ -238,10 +238,15 @@ class SlackClient {
   }
 
   async userContext() {
+    console.log('[userContext] Getting authenticated user context');
     const result = await this.webClient.auth.test({});
+    console.log('[userContext] Auth test successful');
+
     const userResult = await this.webClient.users.info({
       user: result.user_id!,
     });
+    console.log('[userContext] Retrieved user info');
+
     return {
       name: userResult.user?.name || "",
       realName: userResult.user?.profile?.real_name || "",
@@ -251,11 +256,13 @@ class SlackClient {
   }
 
   async listChannels(limit: number = 100, cursor?: string) {
+    console.log(`[listChannels] Fetching channels (limit: ${limit}, cursor: ${cursor ? 'present' : 'none'})`);
     const result = await this.webClient.conversations.list({
       limit: Math.min(limit, 200),
       types: "public_channel,private_channel",
       cursor: cursor,
     });
+    console.log(`[listChannels] Retrieved ${result.channels?.length ?? 0} channels, has_more: ${!!result.response_metadata?.next_cursor}`);
     return {
       channels: result.channels ?? [],
       next_cursor: result.response_metadata?.next_cursor ?? "",
@@ -264,55 +271,75 @@ class SlackClient {
 
   async getChannelByName(name: string) {
     const normalizedName = name.toLowerCase().replace(/^#/, "");
+    console.log('[getChannelByName] Searching for channel');
     let cursor: string | undefined;
+    let pageCount = 0;
     do {
+      pageCount++;
       const result = await this.webClient.conversations.list({
         limit: 200,
         types: "public_channel,private_channel",
         cursor,
       });
+      console.log(`[getChannelByName] Page ${pageCount}: searched ${result.channels?.length ?? 0} channels`);
       const found = result.channels?.find(
         (ch) => ch.name?.toLowerCase() === normalizedName
       );
-      if (found) return found;
+      if (found) {
+        console.log('[getChannelByName] Found channel');
+        return found;
+      }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
+    console.log('[getChannelByName] Channel not found');
     return null;
   }
 
   async searchChannels(query: string, limit: number = 20) {
     const normalizedQuery = query.toLowerCase();
+    console.log(`[searchChannels] Searching for channels (limit: ${limit})`);
     const matches: any[] = [];
     let cursor: string | undefined;
+    let pageCount = 0;
     do {
+      pageCount++;
       const result = await this.webClient.conversations.list({
         limit: 200,
         types: "public_channel,private_channel",
         cursor,
       });
+      console.log(`[searchChannels] Page ${pageCount}: searched ${result.channels?.length ?? 0} channels`);
       for (const channel of result.channels ?? []) {
         if (channel.name?.toLowerCase().includes(normalizedQuery)) {
           matches.push(channel);
-          if (matches.length >= limit) return matches;
+          if (matches.length >= limit) {
+            console.log(`[searchChannels] Found ${matches.length} matches (limit reached)`);
+            return matches;
+          }
         }
       }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
+    console.log(`[searchChannels] Search complete, found ${matches.length} matches`);
     return matches;
   }
 
   async addUserToChannel(channelId: string, userId: string) {
+    console.log('[addUserToChannel] Adding user to channel');
     await this.webClient.conversations.invite({
       channel: channelId,
       users: userId,
     });
+    console.log('[addUserToChannel] Successfully added user to channel');
   }
 
   async getChannelHistory(channelId: string, limit: number = 10) {
+    console.log(`[getChannelHistory] Fetching history (limit: ${limit})`);
     const history = await this.webClient.conversations.history({
       channel: channelId,
       limit: limit,
     });
+    console.log(`[getChannelHistory] Retrieved ${history.messages?.length ?? 0} messages`);
     return history.messages ?? [];
   }
 
@@ -324,12 +351,14 @@ class SlackClient {
   ) {
     const oldest = new Date(start).getTime() / 1000;
     const latest = new Date(end).getTime() / 1000;
+    console.log(`[getChannelHistoryByTime] Fetching history (start: ${start}, end: ${end}, limit: ${limit})`);
     const history = await this.webClient.conversations.history({
       channel: channelId,
       limit: limit,
       oldest: oldest.toString(),
       latest: latest.toString(),
     });
+    console.log(`[getChannelHistoryByTime] Retrieved ${history.messages?.length ?? 0} messages`);
     return history.messages ?? [];
   }
 
@@ -338,30 +367,37 @@ class SlackClient {
     threadId: string,
     limit: number = 10,
   ) {
+    console.log(`[getThreadHistory] Fetching thread history (limit: ${limit})`);
     const replies = await this.webClient.conversations.replies({
       channel: channelId,
       ts: threadId,
       limit: limit,
     });
+    console.log(`[getThreadHistory] Retrieved ${replies.messages?.length ?? 0} messages`);
     return replies.messages ?? [];
   }
 
   async getThreadHistoryFromLink(messageLink: string, limit: number = 10) {
+    console.log('[getThreadHistoryFromLink] Parsing message link');
     const matches = messageLink.match(/archives\/([A-Z0-9]+)\/p(\d+)/);
     if (!matches) {
+      console.error('[getThreadHistoryFromLink] Invalid message link format');
       throw new Error("Invalid message link format");
     }
 
     const channelId = matches[1];
     const threadId = matches[2].slice(0, -6) + "." + matches[2].slice(-6);
+    console.log('[getThreadHistoryFromLink] Extracted thread info from link');
     return await this.getThreadHistory(channelId, threadId, limit);
   }
 
   async searchMessages(query: string, sortByTime: boolean = false) {
+    console.log(`[searchMessages] Searching messages (sort: ${sortByTime ? 'timestamp' : 'score'})`);
     const result = await this.webClient.search.all({
       query: query,
       sort: sortByTime ? "timestamp" : "score",
     });
+    console.log(`[searchMessages] Found ${result.messages?.matches?.length ?? 0} message matches`);
     return result.messages?.matches ?? [];
   }
 
@@ -388,27 +424,33 @@ class SlackClient {
   }
 
   async sendMessage(channelId: string, text: string) {
+    console.log(`[sendMessage] Sending message (length: ${text.length} chars)`);
     const result = await this.webClient.chat.postMessage({
       channel: channelId,
       text: this.markdownToSlack(text),
     });
+    console.log('[sendMessage] Message sent successfully');
     return result;
   }
 
   async sendMessageInThread(channelId: string, threadId: string, text: string) {
+    console.log(`[sendMessageInThread] Sending message in thread (length: ${text.length} chars)`);
     const result = await this.webClient.chat.postMessage({
       channel: channelId,
       thread_ts: threadId,
       text: this.markdownToSlack(text),
     });
+    console.log('[sendMessageInThread] Message sent successfully');
     return result;
   }
 
   async listUsers(limit: number = 100, cursor?: string) {
+    console.log(`[listUsers] Fetching users (limit: ${limit}, cursor: ${cursor ? 'present' : 'none'})`);
     const result = await this.webClient.users.list({
       limit: Math.min(limit, 200),
       cursor: cursor,
     });
+    console.log(`[listUsers] Retrieved ${result.members?.length ?? 0} users, has_more: ${!!result.response_metadata?.next_cursor}`);
     return {
       users: result.members ?? [],
       next_cursor: result.response_metadata?.next_cursor ?? "",
@@ -417,12 +459,16 @@ class SlackClient {
 
   async getUserByName(name: string) {
     const normalizedName = name.toLowerCase().replace(/^@/, "");
+    console.log('[getUserByName] Searching for user');
     let cursor: string | undefined;
+    let pageCount = 0;
     do {
+      pageCount++;
       const result = await this.webClient.users.list({
         limit: 200,
         cursor,
       });
+      console.log(`[getUserByName] Page ${pageCount}: searched ${result.members?.length ?? 0} users`);
       const found = result.members?.find((u) => {
         const username = u.name?.toLowerCase();
         const displayName = u.profile?.display_name?.toLowerCase();
@@ -431,21 +477,29 @@ class SlackClient {
                displayName === normalizedName ||
                realName === normalizedName;
       });
-      if (found) return found;
+      if (found) {
+        console.log('[getUserByName] Found user');
+        return found;
+      }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
+    console.log('[getUserByName] User not found');
     return null;
   }
 
   async searchUsers(query: string, limit: number = 20) {
     const normalizedQuery = query.toLowerCase();
+    console.log(`[searchUsers] Searching for users (limit: ${limit})`);
     const matches: any[] = [];
     let cursor: string | undefined;
+    let pageCount = 0;
     do {
+      pageCount++;
       const result = await this.webClient.users.list({
         limit: 200,
         cursor,
       });
+      console.log(`[searchUsers] Page ${pageCount}: searched ${result.members?.length ?? 0} users`);
       for (const user of result.members ?? []) {
         const username = user.name?.toLowerCase() ?? "";
         const displayName = user.profile?.display_name?.toLowerCase() ?? "";
@@ -454,71 +508,92 @@ class SlackClient {
             displayName.includes(normalizedQuery) ||
             realName.includes(normalizedQuery)) {
           matches.push(user);
-          if (matches.length >= limit) return matches;
+          if (matches.length >= limit) {
+            console.log(`[searchUsers] Found ${matches.length} matches (limit reached)`);
+            return matches;
+          }
         }
       }
       cursor = result.response_metadata?.next_cursor;
     } while (cursor);
+    console.log(`[searchUsers] Search complete, found ${matches.length} matches`);
     return matches;
   }
 
   async sendDM(userIds: string, text: string) {
     const userIdArray = userIds.split(",").map((id) => id.trim());
+    console.log(`[sendDM] Opening DM with ${userIdArray.length} user(s)`);
     const result = await this.webClient.conversations.open({
       users: userIdArray.join(","),
     });
 
     if (!result.ok || !result.channel) {
+      console.error(`[sendDM] Failed to open DM: ${result.error}`);
       throw new Error(`Failed to open DM: ${result.error}`);
     }
+    console.log('[sendDM] DM opened');
 
+    console.log(`[sendDM] Sending message (length: ${text.length} chars)`);
     const messageResult = await this.webClient.chat.postMessage({
       channel: result.channel?.id || "",
       text: this.markdownToSlack(text),
     });
+    console.log('[sendDM] Message sent successfully');
     return messageResult;
   }
 
   async sendDMInThread(userIds: string, threadId: string, text: string) {
     const userIdArray = userIds.split(",").map((id) => id.trim());
+    console.log(`[sendDMInThread] Opening DM with ${userIdArray.length} user(s)`);
     const result = await this.webClient.conversations.open({
       users: userIdArray.join(","),
     });
 
     if (!result.ok || !result.channel) {
+      console.error(`[sendDMInThread] Failed to open DM: ${result.error}`);
       throw new Error(`Failed to open DM: ${result.error}`);
     }
+    console.log('[sendDMInThread] DM opened');
 
+    console.log(`[sendDMInThread] Sending message in thread (length: ${text.length} chars)`);
     const messageResult = await this.webClient.chat.postMessage({
       channel: result.channel?.id || "",
       thread_ts: threadId,
       text: this.markdownToSlack(text),
     });
+    console.log('[sendDMInThread] Message sent successfully');
     return messageResult;
   }
 
   async getMessageLink(channelId: string, messageId: string) {
+    console.log('[getMessageLink] Getting permalink for message');
     const result = await this.webClient.chat.getPermalink({
       channel: channelId,
       message_ts: messageId,
     });
+    console.log('[getMessageLink] Permalink retrieved');
     return result.permalink;
   }
 
   async getDMHistory(userIds: string, limit: number = 10) {
     const userIdArray = userIds.split(",").map((id) => id.trim());
+    console.log(`[getDMHistory] Opening DM with ${userIdArray.length} user(s)`);
     const result = await this.webClient.conversations.open({
       users: userIdArray.join(","),
     });
 
     if (!result.ok || !result.channel) {
+      console.error(`[getDMHistory] Failed to open DM: ${result.error}`);
       throw new Error(`Failed to open DM: ${result.error}`);
     }
+    console.log('[getDMHistory] DM opened');
 
+    console.log(`[getDMHistory] Fetching history (limit: ${limit})`);
     const history = await this.webClient.conversations.history({
       channel: result.channel?.id || "",
       limit: limit,
     });
+    console.log(`[getDMHistory] Retrieved ${history.messages?.length ?? 0} messages`);
     return history.messages ?? [];
   }
 
@@ -528,28 +603,35 @@ class SlackClient {
     limit: number = 10,
   ) {
     const userIdArray = userIds.split(",").map((id) => id.trim());
+    console.log(`[getDMThreadHistory] Opening DM with ${userIdArray.length} user(s)`);
     const result = await this.webClient.conversations.open({
       users: userIdArray.join(","),
     });
 
     if (!result.ok || !result.channel) {
+      console.error(`[getDMThreadHistory] Failed to open DM: ${result.error}`);
       throw new Error(`Failed to open DM: ${result.error}`);
     }
+    console.log('[getDMThreadHistory] DM opened');
 
+    console.log(`[getDMThreadHistory] Fetching thread history (limit: ${limit})`);
     const replies = await this.webClient.conversations.replies({
       channel: result.channel?.id || "",
       ts: threadId,
       limit: limit,
     });
+    console.log(`[getDMThreadHistory] Retrieved ${replies.messages?.length ?? 0} messages`);
     return replies.messages ?? [];
   }
 
   async sendTypingEvent(channelId: string, threadId?: string, status?: string) {
+    console.log(`[sendTypingEvent] Sending typing event${threadId ? ' in thread' : ''} (status: ${status || 'is typing...'})`);
     await this.webClient.assistant.threads.setStatus({
       thread_ts: threadId || "",
       channel_id: channelId,
       status: status || "is typing...",
     });
+    console.log('[sendTypingEvent] Typing event sent successfully');
   }
 }
 
@@ -994,7 +1076,6 @@ const app = express();
 app.use(express.json());
 
 app.post("/mcp", async (req: Request, res: Response) => {
-  console.log(req.headers);
   const server = await getServer();
   try {
     const transport: StreamableHTTPServerTransport =
@@ -1004,7 +1085,6 @@ app.post("/mcp", async (req: Request, res: Response) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
     res.on("close", () => {
-      console.log("Request closed");
       transport.close();
       server.close();
     });
@@ -1024,7 +1104,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
 });
 
 app.get("/mcp", async (_req: Request, res: Response) => {
-  console.log("Received GET MCP request");
+  console.log("GET /mcp - SSE streaming not supported, returning 405 Method Not Allowed");
   res.writeHead(405).end(
     JSON.stringify({
       jsonrpc: "2.0",
