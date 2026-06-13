@@ -7,6 +7,142 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { WebClient } from "@slack/web-api";
 import slackifyMarkdown from "slackify-markdown";
+import { SocketModeClient } from "@slack/socket-mode";
+import { fileURLToPath } from "url";
+
+// ============================================================================
+// Standalone Mode (opt-in Socket Mode inbound-event support)
+// ----------------------------------------------------------------------------
+// Slack's Socket Mode has a hard platform limit: one xapp- token supports at
+// most 10 concurrent WebSocket connections. This feature is therefore
+// intended for single-instance deployments (local dev, hobbyists, small
+// teams, self-hosted). It is gated behind SLACK_APP_TOKEN — when that env
+// var is unset, the codebase behaves identically to upstream today (no WS,
+// no wait_for_event tool in tools/list, GET /mcp returns 405).
+// ============================================================================
+
+export interface SlackQueuedEvent {
+  type: string;
+  event: Record<string, unknown>;
+  receivedAt: number;
+}
+
+const EVENT_QUEUE_MAX = 1000;
+const eventQueue: SlackQueuedEvent[] = [];
+
+/** Insert an event at the tail of the queue. Drops the oldest event when
+ *  the queue is full (bounded at EVENT_QUEUE_MAX). Exported for tests. */
+export const enqueueEvent = (e: SlackQueuedEvent): void => {
+  if (eventQueue.length >= EVENT_QUEUE_MAX) eventQueue.shift();
+  eventQueue.push(e);
+};
+
+/** Pop the oldest event matching the given filters, or return null. The
+ *  returned event is removed from the queue (no double-delivery). */
+export const drainEvent = (filter: {
+  type?: string;
+  sinceTs?: string;
+}): SlackQueuedEvent | null => {
+  const idx = eventQueue.findIndex(
+    (e) =>
+      (!filter.type || e.type === filter.type) &&
+      (!filter.sinceTs || String(e.event.ts ?? "") > filter.sinceTs),
+  );
+  if (idx === -1) return null;
+  const [ev] = eventQueue.splice(idx, 1);
+  return ev;
+};
+
+/** Test-only: clear all queued events. */
+export const clearEventQueue = (): void => {
+  eventQueue.length = 0;
+};
+
+/** Test-only: current queue size. */
+export const eventQueueSize = (): number => eventQueue.length;
+
+let socketClient: SocketModeClient | null = null;
+
+/** True iff Standalone Mode is enabled (Socket Mode client constructed).
+ *  Used by createMcpServer to gate wait_for_event registration and by the
+ *  GET /mcp handler to switch between SSE (on) and 405 (off). */
+export const isStandaloneModeActive = (): boolean => socketClient !== null;
+
+/** Construct the SocketModeClient if not already constructed. Returns the
+ *  client (or null if Standalone Mode prerequisites are missing). The
+ *  returned client has event handlers attached but is not yet started. */
+export const initStandaloneMode = (
+  appToken: string,
+  botToken: string,
+): SocketModeClient | null => {
+  if (socketClient) return socketClient;
+  if (!appToken || !botToken) return null;
+  socketClient = new SocketModeClient({ appToken });
+  for (const type of ["app_mention", "message", "reaction_added"]) {
+    socketClient.on(type, (payload: any) =>
+      enqueueEvent({
+        type,
+        event: payload.event ?? payload,
+        receivedAt: Date.now(),
+      }),
+    );
+  }
+  socketClient.on("connected", () =>
+    console.log("[standalone-mode] socket-mode connected"),
+  );
+  socketClient.on("disconnected", () =>
+    console.warn("[standalone-mode] socket-mode disconnected"),
+  );
+  return socketClient;
+};
+
+/** Start the previously-initialized SocketModeClient. Safe to call when
+ *  initStandaloneMode has not been called (no-op). */
+export const startStandaloneMode = async (): Promise<void> => {
+  if (!socketClient) return;
+  await socketClient.start().catch((e) =>
+    console.error("[standalone-mode] failed to start:", e),
+  );
+};
+
+/** Stop the SocketModeClient and clear the reference. Idempotent. */
+export const stopStandaloneMode = async (): Promise<void> => {
+  if (!socketClient) return;
+  try {
+    await socketClient.disconnect();
+  } catch {
+    // best-effort: ignore shutdown errors
+  }
+  socketClient = null;
+};
+
+/** Module-load: decide whether Standalone Mode is on. When on, emit the
+ *  loud 10-WebSocket-connection warning so accidental scale-out doesn't
+ *  silently drop frames. When off, log a clear "Standalone Mode disabled"
+ *  message so operators know the feature is available but inactive. */
+{
+  const APP_TOKEN = process.env.SLACK_APP_TOKEN;
+  const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+  if (APP_TOKEN && BOT_TOKEN) {
+    const client = initStandaloneMode(APP_TOKEN, BOT_TOKEN);
+    if (client) {
+      console.warn(
+        "[standalone-mode] Standalone Mode ENABLED. " +
+          "Slack limits one xapp- token to 10 concurrent WebSocket connections. " +
+          "This process holds 1. If you scale to multiple replicas, you will " +
+          "hit the cap and drop frames — keep SLACK_APP_TOKEN unset for " +
+          "multi-replica deployments.",
+      );
+      startStandaloneMode().catch(() => undefined);
+    }
+  } else {
+    console.warn(
+      "[standalone-mode] SLACK_APP_TOKEN not set — Standalone Mode disabled. " +
+        "Server is stateless, horizontally scalable, behaves as upstream. " +
+        "Set SLACK_APP_TOKEN (xapp-...) to enable inbound events.",
+    );
+  }
+}
 
 // Schema definitions for all tools
 const ListChannelsSchema = z.object({
@@ -176,6 +312,35 @@ const SendTypingEventSchema = z.object({
       "The status to set the typing event that shows in the slack thread",
     ),
 });
+
+// Standalone Mode: only registered when SLACK_APP_TOKEN is set.
+const WaitForEventSchema = z.object({
+  type: z
+    .string()
+    .optional()
+    .describe(
+      "Filter by event type (e.g. 'app_mention', 'message'). Omit for any.",
+    ),
+  sinceTs: z
+    .string()
+    .optional()
+    .describe("Only return events with Slack ts greater than this."),
+  timeoutMs: z
+    .number()
+    .int()
+    .min(100)
+    .max(30000)
+    .optional()
+    .default(5000)
+    .describe(
+      "How long to block waiting, in ms (default 5000, max 30000).",
+    ),
+});
+type WaitForEventArgs = {
+  type?: string;
+  sinceTs?: string;
+  timeoutMs: number;
+};
 
 // Pass Zod schemas through without triggering deep type inference.
 const toolSchema = (schema: z.ZodTypeAny): z.ZodTypeAny => schema;
@@ -1053,6 +1218,51 @@ function createMcpServer(slackClient: SlackClient, token: string): McpServer {
     },
   );
 
+  // Standalone Mode: only register wait_for_event when Socket Mode is active.
+  // When inactive, the tool is absent from tools/list — the LLM never sees it.
+  if (isStandaloneModeActive()) {
+    registerTool(
+      "wait_for_event",
+      {
+        description:
+          "Block up to timeoutMs for the next inbound Slack event. " +
+          "Available only in Standalone Mode (SLACK_APP_TOKEN must be set). " +
+          "Returns the oldest matching event, or { timedOut: true } if " +
+          "none arrived within the timeout.",
+        inputSchema: toolSchema(WaitForEventSchema),
+      },
+      async (args: WaitForEventArgs): Promise<CallToolResult> => {
+        const deadline = Date.now() + args.timeoutMs;
+        while (Date.now() < deadline) {
+          const ev = drainEvent({
+            type: args.type,
+            sinceTs: args.sinceTs,
+          });
+          if (ev) {
+            const result = { event: ev, timedOut: false };
+            return {
+              structuredContent: result,
+              content: [
+                { type: "text", text: JSON.stringify(result, null, 2) },
+              ],
+            };
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        const result = { timedOut: true };
+        return {
+          structuredContent: result,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      },
+    );
+  }
+
   return server;
 }
 
@@ -1072,7 +1282,9 @@ async function getServer() {
   }
 }
 
-const app = express();
+// Note: `app` is declared here (before the route handlers). The auto-listen
+// guard at the bottom of this file (startServer) uses the same reference.
+export const app = express();
 app.use(express.json());
 
 app.post("/mcp", async (req: Request, res: Response) => {
@@ -1103,19 +1315,38 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (_req: Request, res: Response) => {
-  console.log("GET /mcp - SSE streaming not supported, returning 405 Method Not Allowed");
-  res.writeHead(405).end(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      error: {
-        code: -32000,
-        message: "Method not allowed.",
-      },
-      id: null,
-    }),
-  );
-});
+// Standalone Mode: GET /mcp returns an SSE stream when active, else 405
+// (preserving upstream's current behavior for users who don't opt in).
+if (isStandaloneModeActive()) {
+  app.get("/mcp", async (_req: Request, res: Response) => {
+    // Per MCP spec 2025-03-26: GET returns an SSE stream so the server can
+    // push server-initiated messages (notifications, cancellations, etc.).
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+    res.write("event: endpoint\ndata: /mcp\n\n");
+    const heartbeat = setInterval(
+      () => res.write(": heartbeat\n\n"),
+      15000,
+    );
+    _req.on("close", () => clearInterval(heartbeat));
+  });
+} else {
+  app.get("/mcp", async (_req: Request, res: Response) => {
+    res.writeHead(405).end(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Method not allowed.",
+        },
+        id: null,
+      }),
+    );
+  });
+}
 
 app.delete("/mcp", async (_req: Request, res: Response) => {
   console.log("Received DELETE MCP request");
@@ -1131,17 +1362,27 @@ app.delete("/mcp", async (_req: Request, res: Response) => {
   );
 });
 
-// Start the server
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-app.listen(PORT, () => {
-  console.log(
-    `Slack MCP Stateless Streamable HTTP Server listening on port ${PORT}`,
-  );
-});
+// Start the server (only when this file is the entry point, not when
+// imported by tests). When imported as a module, the consumer is expected
+// to call startServer() themselves.
+const isMain = process.argv[1] === fileURLToPath(import.meta.url);
+export const startServer = (port: number = 3000) =>
+  app.listen(port, () => {
+    console.log(
+      `Slack MCP Stateless Streamable HTTP Server listening on port ${port}`,
+    );
+  });
+if (isMain) {
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  startServer(PORT);
+}
 
 // Handle server shutdown
-process.on("SIGINT", async () => {
-  console.log("Shutting down server...");
+async function shutdown(reason: string) {
+  console.log(`Shutting down server (${reason})...`);
+  await stopStandaloneMode();
   process.exit(0);
-});
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
